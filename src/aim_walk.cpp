@@ -30,8 +30,6 @@ constexpr int kAimSpeedId = 101, kSensitivityId = 102, kPitchLimitId = 103;
 constexpr int kCameraCheckId = 201, kTpsMoveCheckId = 202, kAimWalkCheckId = 203;
 constexpr float kPi = 3.14159265358979323846f;
 constexpr float kDefaultAimSpeed = 1800.0f;
-constexpr float kAcceleration = 5000.0f;
-constexpr float kBraking = 6000.0f;
 constexpr float kTpsTurnRate = 540.0f;  // degrees per second
 
 using DispatchFn = void(__cdecl*)(uint8_t* player);
@@ -398,12 +396,6 @@ void ToggleSettingsOnF1(bool isLeon) {
   previous = down;
 }
 
-float Approach(float value, float target, float amount) {
-  if (value < target) return (value + amount > target) ? target : value + amount;
-  if (value > target) return (value - amount < target) ? target : value - amount;
-  return target;
-}
-
 void ApplyAimWalk(uint8_t* player, float dt) {
   // The knife binding is a game action, not a physical key: use its logical
   // input bit so remapped controls work. Keep movement active in the weapon
@@ -426,9 +418,10 @@ void ApplyAimWalk(uint8_t* player, float dt) {
   const float inputLength = std::sqrt(forward * forward + side * side);
   if (inputLength > 1.0f) { forward /= inputLength; side /= inputLength; }
   const float maxSpeed = g_aimSpeed.load();
-  const float delta = (inputLength > 0.0f ? kAcceleration : kBraking) * dt;
-  g_velocityForward = Approach(g_velocityForward, forward * maxSpeed, delta);
-  g_velocitySide = Approach(g_velocitySide, side * maxSpeed, delta);
+  // Aim/knife movement should respond directly to the keys, without the
+  // acceleration and braking ramp used by the earlier experimental pass.
+  g_velocityForward = forward * maxSpeed;
+  g_velocitySide = side * maxSpeed;
   const float velocityLength = std::sqrt(g_velocityForward * g_velocityForward + g_velocitySide * g_velocitySide);
   if (velocityLength > maxSpeed) { g_velocityForward *= maxSpeed / velocityLength; g_velocitySide *= maxSpeed / velocityLength; }
 
