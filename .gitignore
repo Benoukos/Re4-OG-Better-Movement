@@ -1,0 +1,6 @@
+/build/
+/build-*/
+/work/
+*.dll
+*.asi
+!/dist/RE4OGAimWalk.asi
