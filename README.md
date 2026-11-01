@@ -28,7 +28,9 @@ cmake -S . -B build -G "Visual Studio 17 2022" -A Win32
 cmake --build build --config Release
 ```
 
-The output is `build/Release/RE4OGAimWalk.asi`. The included Ultimate ASI Loader v10.0.2 (`third_party/ultimate-asi-loader/dinput8.dll`, MIT license) loads the plugin from the game's `Bin32` folder.
+The build produces the regular `RE4OGAimWalk.asi` for standalone use, plus `re4bettermovement.dll` and a proxy `dinput8.dll` for COOP. The COOP proxy forwards all six DirectInput exports to the original COOP DLL, saved as `RE4CoopDinput8.dll`, then starts the movement plugin directly. This avoids depending on the COOP loader discovering an external ASI.
+
+For the COOP setup, run `install-coop.ps1`. It preserves the COOP DLL as `RE4CoopDinput8.dll` and installs the proxy and movement plugin beside `bio4.exe`. The proxy writes `re4bettermovement-loader.log` so startup and plugin load failures are visible.
 
 To uninstall the installed files safely:
 

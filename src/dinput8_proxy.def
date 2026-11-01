@@ -1,0 +1,8 @@
+LIBRARY dinput8
+EXPORTS
+    DirectInput8Create=RE4CoopDinput8.DirectInput8Create @1
+    DllCanUnloadNow=RE4CoopDinput8.DllCanUnloadNow @2
+    DllGetClassObject=RE4CoopDinput8.DllGetClassObject @3
+    DllRegisterServer=RE4CoopDinput8.DllRegisterServer @4
+    DllUnregisterServer=RE4CoopDinput8.DllUnregisterServer @5
+    GetdfDIJoystick=RE4CoopDinput8.GetdfDIJoystick @6
