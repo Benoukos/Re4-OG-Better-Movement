@@ -47,16 +47,20 @@ std::atomic<int> g_pitchLimitDegrees{45};
 std::atomic<bool> g_cameraEnabled{true};
 std::atomic<bool> g_tpsMovementEnabled{true};
 std::atomic<bool> g_aimWalkEnabled{true};
-std::atomic<bool> g_traceAimMouse{true};
 std::atomic<float> g_viewYaw{0.0f};
 std::atomic<bool> g_haveViewYaw{false};
 std::atomic<float> g_lastOrbitYaw{0.0f};
 std::atomic<bool> g_haveLastOrbitYaw{false};
 volatile LONG g_mouseDx = 0, g_mouseDy = 0;
+volatile LONG g_skipNativeAimAccel = 0;
+volatile uint8_t* g_mouseAimMode = nullptr;
+volatile LONG g_loggedAimAccelBypass = 0;
 float g_cameraYaw = 0.0f, g_pitchOffset = 0.0f;
 bool g_haveCameraYaw = false;
-bool g_previousAimAction = false;
 float g_velocityForward = 0.0f, g_velocitySide = 0.0f;
+bool g_previousAimAction = false;
+float g_aimTurnTargetYaw = 0.0f;
+bool g_pendingAimYawSnap = false;
 HHOOK g_mouseHook = nullptr;
 LONG g_lastMouseX = 0, g_lastMouseY = 0;
 bool g_haveMousePoint = false;
@@ -167,6 +171,114 @@ bool GameIsForeground() {
   return pid == GetCurrentProcessId();
 }
 
+bool NativeAimActive() {
+  auto slot = reinterpret_cast<uint8_t* volatile*>(AtVa(kPlayerPtrVa));
+  uint8_t* player = slot ? *slot : nullptr;
+  return player && player[0xFC] == 0 &&
+         (player[0xFD] == 6 || player[0xFD] == 11);
+}
+
+uintptr_t FindImagePattern(const uint8_t* pattern, const char* mask, size_t length, size_t startOffset = 0) {
+  const auto* base = reinterpret_cast<const uint8_t*>(g_moduleBase);
+  if (!base) return 0;
+  const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(base);
+  if (dos->e_magic != IMAGE_DOS_SIGNATURE) return 0;
+  const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS32*>(base + dos->e_lfanew);
+  if (nt->Signature != IMAGE_NT_SIGNATURE) return 0;
+  const size_t imageSize = nt->OptionalHeader.SizeOfImage;
+  for (size_t offset = startOffset; offset + length <= imageSize; ++offset) {
+    bool matched = true;
+    for (size_t i = 0; i < length; ++i) {
+      if (mask[i] == 'x' && base[offset + i] != pattern[i]) { matched = false; break; }
+    }
+    if (matched) return reinterpret_cast<uintptr_t>(base + offset);
+  }
+  return 0;
+}
+
+void EmitRelJump(uint8_t* stub, size_t& position, uintptr_t target) {
+  stub[position++] = 0xE9;
+  const int32_t displacement = static_cast<int32_t>(target -
+      reinterpret_cast<uintptr_t>(stub + position + sizeof(int32_t)));
+  std::memcpy(stub + position, &displacement, sizeof(displacement));
+  position += sizeof(displacement);
+}
+
+void __cdecl PrepareRawAimAccelBypass() {
+  const bool useRawAim = GameIsForeground() && NativeAimActive();
+  InterlockedExchange(&g_skipNativeAimAccel, useRawAim ? 1 : 0);
+  if (useRawAim) {
+    if (g_mouseAimMode) *g_mouseAimMode = 1; // Classic=0, Modern=1.
+    if (InterlockedCompareExchange(&g_loggedAimAccelBypass, 1, 0) == 0)
+      LogLine("Diagnostic: raw aim acceleration bypass executed.");
+  }
+}
+
+bool InstallAimAccelBypassAt(uintptr_t site) {
+  auto* source = reinterpret_cast<const uint8_t*>(site);
+  uint8_t* stub = static_cast<uint8_t*>(VirtualAlloc(nullptr, 128, MEM_COMMIT | MEM_RESERVE,
+                                                     PAGE_EXECUTE_READWRITE));
+  if (!stub) return false;
+  size_t n = 0;
+  stub[n++] = 0x9C; stub[n++] = 0x60; // pushfd; pushad
+  stub[n++] = 0xB8;
+  const uint32_t helper = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(&PrepareRawAimAccelBypass));
+  std::memcpy(stub + n, &helper, 4); n += 4;
+  stub[n++] = 0xFF; stub[n++] = 0xD0; // call eax
+  stub[n++] = 0x61; stub[n++] = 0x9D; // popad; popfd
+  stub[n++] = 0x9C; // save original flags for the branch test
+  stub[n++] = 0x83; stub[n++] = 0x3D;
+  const uint32_t bypass = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(&g_skipNativeAimAccel));
+  std::memcpy(stub + n, &bypass, 4); n += 4;
+  stub[n++] = 0x00; // cmp dword ptr [bypass], 0
+  stub[n++] = 0x74;
+  const size_t fallbackDisplacement = n++;
+  stub[n++] = 0x9D; // restore flags
+  stub[n++] = 0x50; // push eax
+  stub[n++] = 0xB8; stub[n++] = 1; stub[n++] = 0; stub[n++] = 0; stub[n++] = 0;
+  stub[n++] = 0x83; stub[n++] = 0xF8; stub[n++] = 0; // cmp eax,0 => ZF=0, CF=0
+  stub[n++] = 0x58; // pop eax (does not change flags)
+  EmitRelJump(stub, n, site + 7);
+  const size_t fallback = n;
+  stub[n++] = 0x9D;
+  std::memcpy(stub + n, source, 7); n += 7; // native cmp when not aiming with raw input
+  EmitRelJump(stub, n, site + 7);
+  stub[fallbackDisplacement] = static_cast<uint8_t>(fallback - (fallbackDisplacement + 1));
+
+  DWORD oldProtect = 0;
+  auto* patchSite = reinterpret_cast<uint8_t*>(site);
+  if (!VirtualProtect(patchSite, 7, PAGE_EXECUTE_READWRITE, &oldProtect)) return false;
+  patchSite[0] = 0xE9;
+  const int32_t jump = static_cast<int32_t>(reinterpret_cast<uintptr_t>(stub) - (site + 5));
+  std::memcpy(patchSite + 1, &jump, 4);
+  patchSite[5] = 0x90; patchSite[6] = 0x90;
+  FlushInstructionCache(GetCurrentProcess(), patchSite, 7);
+  DWORD ignored = 0;
+  VirtualProtect(patchSite, 7, oldProtect, &ignored);
+  return true;
+}
+
+bool InstallAimAccelBypass() {
+  static const uint8_t pattern[] = {
+      0x83,0x3D,0,0,0,0,0,0x75,0,0x83,0x3D,0,0,0,0,0,0x75,0x0E,
+      0x85,0xC0,0x75,0,0xD9,0xEE,0xD9};
+  static const char mask[] = "xx?????x?xx????xxxxxx?xxx";
+  const uintptr_t first = FindImagePattern(pattern, mask, sizeof(pattern));
+  if (!first) return false;
+  const size_t secondStart = static_cast<size_t>(first - g_moduleBase + 1);
+  const uintptr_t second = FindImagePattern(pattern, mask, sizeof(pattern), secondStart);
+  if (!second) return false;
+  return InstallAimAccelBypassAt(first) && InstallAimAccelBypassAt(second);
+}
+
+void FindAimModePointer() {
+  static const uint8_t pattern[] = {0x80,0x3D,0,0,0,0,0,0x0F,0xB6,0x05};
+  static const char mask[] = "xx?????xxx";
+  const uintptr_t site = FindImagePattern(pattern, mask, sizeof(pattern));
+  if (site) g_mouseAimMode = reinterpret_cast<volatile uint8_t*>(
+      *reinterpret_cast<const uint32_t*>(site + 2));
+}
+
 LRESULT CALLBACK LowLevelMouseProc(int code, WPARAM message, LPARAM data) {
   if (code == HC_ACTION && message == WM_MOUSEMOVE && data) {
     const auto* mouse = reinterpret_cast<const MSLLHOOKSTRUCT*>(data);
@@ -176,8 +288,17 @@ LRESULT CALLBACK LowLevelMouseProc(int code, WPARAM message, LPARAM data) {
       InterlockedExchange(&g_mouseDy, 0);
       return CallNextHookEx(g_mouseHook, code, message, data);
     }
-    const bool orbit = g_cameraEnabled.load() && GameIsForeground() && ((HeldActions() & (kAim | kKnife)) == 0);
-    if (!orbit) {
+    const bool foreground = GameIsForeground();
+    const uint64_t actions = foreground ? HeldActions() : 0;
+    auto playerSlot = reinterpret_cast<uint8_t* volatile*>(AtVa(kPlayerPtrVa));
+    uint8_t* player = foreground && playerSlot ? *playerSlot : nullptr;
+    const bool aimState = player && player[0xFC] == 0 &&
+                          (player[0xFD] == 6 || player[0xFD] == 11);
+    // Knife-ready is a latched game state: the initiating key may no longer
+    // be held once r1 has entered 11, but mouse aim must stay active.
+  const bool aimInput = (actions & (kAim | kKnife)) != 0 || aimState;
+  const bool orbit = !aimInput && g_cameraEnabled.load() && foreground;
+  if (!orbit) {
       g_haveMousePoint = false;
       return CallNextHookEx(g_mouseHook, code, message, data);
     }
@@ -204,28 +325,14 @@ LRESULT CALLBACK LowLevelMouseProc(int code, WPARAM message, LPARAM data) {
     const LONG dx = mouse->pt.x - g_lastMouseX;
     const LONG dy = mouse->pt.y - g_lastMouseY;
     if (std::abs(dx) < 300 && std::abs(dy) < 300) {
-      auto playerSlot = reinterpret_cast<uint8_t* volatile*>(AtVa(kPlayerPtrVa));
-      uint8_t* player = playerSlot ? *playerSlot : nullptr;
-      const bool aiming = player && player[0xFC] == 0 && player[0xFD] == 6 &&
-                          (HeldActions() & kAim) != 0;
-      if (aiming && g_traceAimMouse.load()) {
-        static LONG traceX = 0, traceY = 0;
-        InterlockedExchangeAdd(&traceX, dx);
-        InterlockedExchangeAdd(&traceY, dy);
-        const LONG totalX = InterlockedExchange(&traceX, 0) + dx;
-        const LONG totalY = InterlockedExchange(&traceY, 0) + dy;
-        char line[112]{};
-        std::snprintf(line, sizeof(line), "AIM mouse delta: dx=%ld dy=%ld", totalX, totalY);
-        LogLine(line);
-      } else {
-        InterlockedExchangeAdd(&g_mouseDx, dx);
-        InterlockedExchangeAdd(&g_mouseDy, dy);
-      }
+      InterlockedExchangeAdd(&g_mouseDx, dx);
+      InterlockedExchangeAdd(&g_mouseDy, dy);
     }
     g_lastMouseX = center.x;
     g_lastMouseY = center.y;
     if (mouse->pt.x != center.x || mouse->pt.y != center.y) SetCursorPos(center.x, center.y);
-    return 1;  // consume this relative move; the plugin owns FCM input
+    // Consume only free-camera orbit input; aim input passes to the game.
+    return 1;
   }
   return CallNextHookEx(g_mouseHook, code, message, data);
 }
@@ -491,18 +598,27 @@ void __cdecl DispatchHook(uint8_t* player) {
     player[0xFD] = 0;
     player[0xFE] = 0;
   }
+  const bool activeAimState = player && player[0xFC] == 0 &&
+      (player[0xFD] == 6 || player[0xFD] == 11);
+  const bool aimAction = (held & (kAim | kKnife)) != 0 || activeAimState;
   if (isLeon) {
-    const bool aimAction = (held & (kAim | kKnife)) != 0;
     if (aimAction && !g_previousAimAction) {
-      // On aim entry, point Leon where the free camera was already looking.
-      const float cameraYaw = (g_cameraEnabled.load() && g_haveLastOrbitYaw.load())
-                                  ? g_lastOrbitYaw.load()
-                                  : g_viewYaw.load();
+      g_haveMousePoint = false;
+      InterlockedExchange(&g_mouseDx, 0);
+      InterlockedExchange(&g_mouseDy, 0);
+      // Snap once to the free TPS camera heading when AIM/KNIFE starts. Do
+      // not keep feeding the aim-camera yaw back into Leon every frame: the
+      // native aim camera is relative to Leon, so that creates a yaw feedback
+      // loop and spins him continuously. Defer the write until after the
+      // native player dispatcher, which otherwise overwrites the new heading.
+      const float cameraYaw = g_viewYaw.load();
       if (std::isfinite(cameraYaw)) {
-        *reinterpret_cast<float*>(player + 0xA4) = cameraYaw;
-        g_viewYaw.store(cameraYaw);
-        g_haveViewYaw.store(true);
+        g_aimTurnTargetYaw = WrapAngle(cameraYaw);
+        g_pendingAimYawSnap = true;
       }
+    }
+    if (!aimAction) {
+      g_pendingAimYawSnap = false;
     }
     g_previousAimAction = aimAction;
   }
@@ -512,6 +628,10 @@ void __cdecl DispatchHook(uint8_t* player) {
   if (isLeon && player[0xFC] == 0 && player[0xFD] == 5) {
     player[0xFD] = 0;
     player[0xFE] = 0;
+  }
+  if (isLeon && aimAction && g_pendingAimYawSnap) {
+    *reinterpret_cast<float*>(player + 0xA4) = g_aimTurnTargetYaw;
+    g_pendingAimYawSnap = false;
   }
 }
 
@@ -543,9 +663,19 @@ void __cdecl LookAtHook(float* block) {
   float* target = block + 0x2C;
   const float* pos = player ? reinterpret_cast<float*>(player + 0x94) : nullptr;
   const uint8_t cameraMode = *reinterpret_cast<volatile uint8_t*>(AtVa(kCameraVa) + 0x34);
-  // Keep the game's native camera for aim/knife and every non-follow camera mode.
-  const bool actionHeld = (HeldActions() & (kAim | kKnife)) != 0;
-  if (!player || !pos || player[0xFC] != 0 || player[0xFD] > 6 || cameraMode != 10 || actionHeld) {
+  // AIM and knife use the game's own camera path. The plugin only owns the
+  // follow-camera orbit outside those actions.
+  const bool aimState = player && player[0xFC] == 0 &&
+                        (player[0xFD] == 6 || player[0xFD] == 11);
+  if (aimState) {
+    g_haveCameraYaw = false;
+    InterlockedExchange(&g_mouseDx, 0);
+    InterlockedExchange(&g_mouseDy, 0);
+    g_lookAtOriginal(block);
+    return;
+  }
+  if (!player || !pos || player[0xFC] != 0 || player[0xFD] > 11 ||
+      (player[0xFD] > 6 && player[0xFD] != 11) || cameraMode != 10) {
     g_haveCameraYaw = false;
     InterlockedExchange(&g_mouseDx, 0);
     InterlockedExchange(&g_mouseDy, 0);
@@ -554,9 +684,9 @@ void __cdecl LookAtHook(float* block) {
     g_lookAtOriginal(block);
     return;
   }
-
   const float baseYaw = std::atan2(target[0] - eye[0], target[2] - eye[2]);
   if (!std::isfinite(baseYaw)) { g_lookAtOriginal(block); return; }
+
   if (g_cameraEnabled.load()) {
     if (!g_haveCameraYaw) { g_cameraYaw = baseYaw; g_haveCameraYaw = true; }
     const LONG dx = std::clamp(InterlockedExchange(&g_mouseDx, 0), -80L, 80L);
@@ -586,9 +716,13 @@ void __cdecl LookAtHook(float* block) {
   }
   g_lookAtOriginal(block);
 }
+
 void Install() {
   g_moduleBase = reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
   if (!SupportedExe()) { LogLine("Refused to load: bio4.exe timestamp does not match supported Steam UHD build."); return; }
+  FindAimModePointer();
+  if (InstallAimAccelBypass()) LogLine("Vanilla aim enabled with Modern mouse mode and native acceleration bypass.");
+  else LogLine("Vanilla aim enabled; acceleration bypass unavailable.");
   LoadSettings();
   if (MH_Initialize() != MH_OK) { LogLine("MinHook initialization failed."); return; }
   void* dispatch = reinterpret_cast<void*>(AtVa(kDispatchVa));
